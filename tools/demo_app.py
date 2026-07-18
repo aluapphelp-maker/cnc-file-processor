@@ -24,10 +24,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import streamlit as st
 
+from matplotlib.patches import Circle
+
 from core.dft_parser import read_dft
 from core.dxf_reader import read_dxf_geometry
 from core.dxf_to_dft import convert_dxf_to_dft_file, dxf_to_dft
 from core.generator_laser import plan_microjoints
+from core.generator_punching import ROUND_TOOL_DIAMETER, nibble_positions
 from core.laser_analysis import detect_laser_stops
 from core.transform import to_sheet_space
 from core.validator import compare_dft_files
@@ -78,15 +81,36 @@ def _convert_one(
         dft=dft,
     )
 
-    detected = None
-    laser_caption = ""
+    markers = None
+    marker_kind = None
+    result_caption = ""
     if machine_type == "laser":
         joints = plan_microjoints(sheet, spacing=stop_spacing)
         raw = read_dft(out_path)
-        detected, summary = detect_laser_stops(raw)
-        laser_caption = (
+        markers, summary = detect_laser_stops(raw)
+        marker_kind = "laser"
+        result_caption = (
             f"Planned {len(joints)} · detected {summary.microjoint_count} · "
             f"mean ≈ {(summary.mean_spacing or 0):.0f} mm"
+        )
+    else:
+        # Modelled Ø3 nibble hits along the contour (factory DFT is contour LINES;
+        # hits make the punching path visually distinct from the DXF).
+        hits = []
+        for seg in sheet:
+            hits.extend(
+                nibble_positions(
+                    seg.start.x,
+                    seg.start.y,
+                    seg.end.x,
+                    seg.end.y,
+                    tool_diameter=ROUND_TOOL_DIAMETER,
+                )
+            )
+        markers = hits
+        marker_kind = "punch"
+        result_caption = (
+            f"{len(hits)} punch hits · Ø{ROUND_TOOL_DIAMETER:g} mm · 20% overlap"
         )
 
     compare_msg = None
@@ -119,12 +143,13 @@ def _convert_one(
             f"{dft.machine_config.extent_width:.0f}"
             f"×{dft.machine_config.extent_height:.0f}"
         ),
-        "detected": detected,
-        "laser_caption": laser_caption,
+        "markers": markers,
+        "marker_kind": marker_kind,
+        "result_caption": result_caption,
         "result_title": (
             f"{stem} laser — stops every {stop_spacing:g} mm"
             if machine_type == "laser"
-            else f"{stem} punching — contour tool path"
+            else f"{stem} punching — Ø{ROUND_TOOL_DIAMETER:g} mm nibble path"
         ),
         "compare_ok": compare_ok,
         "compare_msg": compare_msg,
@@ -145,6 +170,7 @@ def _plot_png(
     segments,
     *,
     joints=None,
+    marker_kind: str | None = None,
     title: str = "",
     figsize=_PREVIEW_SIZE,
     dpi: int = 120,
@@ -155,18 +181,67 @@ def _plot_png(
         large = figsize[0] >= 10
         lw = 1.8 if large else 1.25
         ms = 48 if large else 28
+        # Punching: faint guide contour under the hit footprints
+        contour_color = "#9aa8b5" if marker_kind == "punch" else "#1f4e79"
+        contour_lw = 0.9 if marker_kind == "punch" else lw
         for seg in segments:
             ax.plot(
                 [seg.start.x, seg.end.x],
                 [seg.start.y, seg.end.y],
-                color="#1f4e79",
-                linewidth=lw,
+                color=contour_color,
+                linewidth=contour_lw,
+                zorder=1,
             )
         if joints:
             xs = [j.x for j in joints if j.x is not None]
             ys = [j.y for j in joints if j.y is not None]
             if xs:
-                ax.scatter(xs, ys, c="#c45c26", s=ms, zorder=5, label="MicroJoints (stops)")
+                if marker_kind == "punch":
+                    # Scatter is fast enough for Streamlit reruns; circles only
+                    # when expanded (and still subsampled for huge contours).
+                    if large:
+                        radius = ROUND_TOOL_DIAMETER / 2.0
+                        step = 1 if len(xs) <= 600 else max(1, len(xs) // 600)
+                        for x, y in zip(xs[::step], ys[::step]):
+                            ax.add_patch(
+                                Circle(
+                                    (x, y),
+                                    radius=radius,
+                                    facecolor="#1a6b8a",
+                                    edgecolor="#0d455c",
+                                    alpha=0.4,
+                                    linewidth=0.35,
+                                    zorder=3,
+                                )
+                            )
+                    else:
+                        step = 1 if len(xs) <= 500 else max(1, len(xs) // 500)
+                        ax.scatter(
+                            xs[::step],
+                            ys[::step],
+                            c="#1a6b8a",
+                            s=14,
+                            alpha=0.75,
+                            edgecolors="#0d455c",
+                            linewidths=0.25,
+                            zorder=3,
+                        )
+                    ax.scatter(
+                        [],
+                        [],
+                        c="#1a6b8a",
+                        s=40,
+                        label=f"Punch hits (Ø{ROUND_TOOL_DIAMETER:g} mm)",
+                    )
+                else:
+                    ax.scatter(
+                        xs,
+                        ys,
+                        c="#c45c26",
+                        s=ms,
+                        zorder=5,
+                        label="MicroJoints (stops)",
+                    )
                 ax.legend(loc="best", fontsize=10 if large else 8)
         ax.set_aspect("equal", adjustable="datalim")
         ax.set_box_aspect(1)
@@ -208,11 +283,18 @@ def _expanded_preview() -> None:
     )
 
 
-def _open_expand(segments, *, joints=None, title: str = "") -> None:
+def _open_expand(
+    segments,
+    *,
+    joints=None,
+    marker_kind: str | None = None,
+    title: str = "",
+) -> None:
     st.session_state["expand_title"] = title
     st.session_state["expand_png"] = _plot_png(
         segments,
         joints=joints,
+        marker_kind=marker_kind,
         title=title,
         figsize=_EXPANDED_SIZE,
         dpi=_EXPANDED_DPI,
@@ -224,6 +306,7 @@ def _show_preview(
     segments,
     *,
     joints=None,
+    marker_kind: str | None = None,
     title: str = "",
     key: str = "preview",
     heading: str = "",
@@ -243,9 +326,20 @@ def _show_preview(
             icon=":material/open_in_full:",
             help="Expand preview",
         ):
-            _open_expand(segments, joints=joints, title=title)
+            _open_expand(
+                segments,
+                joints=joints,
+                marker_kind=marker_kind,
+                title=title,
+            )
     size = _PREVIEW_SIZE_COMPACT if compact else _PREVIEW_SIZE
-    thumb = _plot_png(segments, joints=joints, title=title, figsize=size)
+    thumb = _plot_png(
+        segments,
+        joints=joints,
+        marker_kind=marker_kind,
+        title=title,
+        figsize=size,
+    )
     st.image(thumb, width="stretch")
 
 
@@ -554,7 +648,7 @@ def main() -> None:
                         "1. Read **KNA - Contour** from DXF  \n"
                         "2. Translate world → sheet  \n"
                         "3. Emit `[200]` + `[300]` LINES  \n"
-                        "4. Laser: `[350]` MicroJoints every *N* mm"
+                        "4. Punching: Ø3 mm nibble hits · Laser: `[350]` MicroJoints"
                     )
                     st.info(
                         f"Click **Convert all ({n_jobs})** in the sidebar."
@@ -577,7 +671,7 @@ def main() -> None:
                         if result["machine_type"] == "laser"
                         else f"{stem} · Punching"
                     )
-                caption = result["laser_caption"] or ""
+                caption = result.get("result_caption") or ""
                 if result["compare_msg"] and compact:
                     caption = (
                         f"{caption} · {result['compare_msg']}"
@@ -586,7 +680,8 @@ def main() -> None:
                     )
                 _show_preview(
                     sheet,
-                    joints=result["detected"],
+                    joints=result.get("markers"),
+                    marker_kind=result.get("marker_kind"),
                     title=result["result_title"],
                     key=f"result_{stem}",
                     heading=heading,
